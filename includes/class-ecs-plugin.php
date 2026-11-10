@@ -489,8 +489,13 @@ class ECS_Plugin {
       }
       if (function_exists('mb_substr')) $value = mb_substr($value, 0, 250);
       else $value = substr($value, 0, 250);
-      if ($value === '') delete_user_meta($user_id, $key);
-      else update_user_meta($user_id, $key, $value);
+      $exists = metadata_exists('user', $user_id, $key);
+      $current = $exists ? get_user_meta($user_id, $key, true) : null;
+      if ($value === '') {
+        if ($exists && (!is_scalar($current) || (string)$current !== '')) delete_user_meta($user_id, $key);
+      } elseif (!$exists || !is_scalar($current) || (string)$current !== $value) {
+        update_user_meta($user_id, $key, $value);
+      }
     }
   }
 
