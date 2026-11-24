@@ -9,6 +9,8 @@ class ECS_Plugin {
   const META_CENTRAL_ID = '_ecs_central_user_id';
   const META_STATUS = '_ecs_connected_site_status';
   const META_PROFILE_IMAGE_URL = '_ecs_central_profile_image_url';
+  const PROFILE_IMAGE_DIR = 'ecs-profile-images';
+  const MAX_PROFILE_IMAGE_BYTES = 262144;
   const META_PROFILE_DATA = '_ecs_central_profile_data';
   const STATE_PREFIX = 'ecs_sso_state_';
 
@@ -22,6 +24,7 @@ class ECS_Plugin {
     add_action('admin_post_nopriv_ecs_sso_callback', [$this, 'finish_sso']);
     add_action('admin_post_ecs_sso_callback', [$this, 'finish_sso']);
     add_action('login_form', [$this, 'render_login_link']);
+    add_action('delete_user', [$this, 'delete_profile_image']);
     add_filter('get_avatar_data', [$this, 'filter_avatar_data'], 10, 2);
     add_filter('get_avatar_url', [$this, 'filter_avatar_url'], 10, 3);
     add_filter('wp_authenticate_user', [$this, 'reject_inactive_linked_user'], 20, 2);
@@ -307,6 +310,7 @@ class ECS_Plugin {
         $message = is_wp_error($removed) ? $removed->get_error_message() : 'WordPress could not remove the user from this site.';
         return ['central_user_id' => $central_id, 'status' => 'failed', 'message' => sanitize_text_field($message)];
       }
+      $this->delete_profile_image($local_id);
       return ['central_user_id' => $central_id, 'status' => 'deleted'];
     }
 
@@ -426,7 +430,6 @@ class ECS_Plugin {
       $this->set_account_status($existing_id, $account_status);
       update_user_meta($existing_id, 'first_name', $first_name);
       update_user_meta($existing_id, 'last_name', $last_name);
-      $this->sync_profile_image_url($existing_id, $data, $issuer);
       $this->sync_profile_data($existing_id, $data);
       $this->sync_public_meta($existing_id, $data);
       if (isset($update['role'])) update_user_meta($existing_id, '_ecs_site_role', $site_role);
@@ -435,7 +438,7 @@ class ECS_Plugin {
         'local_user_id' => $existing_id,
         'status' => $mapped_by_email ? 'linked' : 'updated',
         'message' => $mapped_by_email ? 'Existing account linked by email and updated.' : 'Account updated.',
-      ];
+      ] + $this->sync_profile_image($existing_id, $data);
     }
 
     if ($email !== '' && email_exists($email)) {
@@ -467,10 +470,9 @@ class ECS_Plugin {
     update_user_meta((int)$new_user_id, self::META_CENTRAL_ID, $central_id);
     $this->set_account_status((int)$new_user_id, $account_status);
     update_user_meta((int)$new_user_id, '_ecs_site_role', $site_role);
-    $this->sync_profile_image_url((int)$new_user_id, $data, $issuer);
     $this->sync_profile_data((int)$new_user_id, $data);
     $this->sync_public_meta((int)$new_user_id, $data);
-    return ['central_user_id' => $central_id, 'local_user_id' => (int)$new_user_id, 'status' => 'created', 'message' => 'Account created.'];
+    return ['central_user_id' => $central_id, 'local_user_id' => (int)$new_user_id, 'status' => 'created', 'message' => 'Account created.'] + $this->sync_profile_image((int)$new_user_id, $data);
   }
 
   private function sync_public_meta(int $user_id, array $data): void {
@@ -505,7 +507,7 @@ class ECS_Plugin {
     $profile_data = [];
     foreach (array_slice($incoming, 0, 100, true) as $field_id => $value) {
       $field_id = strtolower((string)preg_replace('/[^a-zA-Z0-9:_-]/', '', (string)$field_id));
-      if ($field_id === '' || !is_scalar($value)) continue;
+      if ($field_id === '' || $field_id === 'core:eum_profile_image_url' || !is_scalar($value)) continue;
       $value = sanitize_textarea_field((string)$value);
       if (function_exists('mb_substr')) $value = mb_substr($value, 0, 2000);
       else $value = substr($value, 0, 2000);
@@ -531,18 +533,96 @@ class ECS_Plugin {
     return $user;
   }
 
-  private function sync_profile_image_url(int $user_id, array $data, string $issuer): void {
-    if (!array_key_exists('profile_image_url', $data)) return;
-    $image_url = esc_url_raw((string)$data['profile_image_url']);
-    $image_host = strtolower((string)wp_parse_url($image_url, PHP_URL_HOST));
-    $issuer_host = strtolower((string)wp_parse_url($issuer, PHP_URL_HOST));
-    $scheme = strtolower((string)wp_parse_url($image_url, PHP_URL_SCHEME));
-    $has_credentials = wp_parse_url($image_url, PHP_URL_USER) !== null || wp_parse_url($image_url, PHP_URL_PASS) !== null;
-    if ($image_url === '' || $scheme !== 'https' || $image_host === '' || $image_host !== $issuer_host || $has_credentials) {
-      delete_user_meta($user_id, self::META_PROFILE_IMAGE_URL);
-      return;
+  private function sync_profile_image(int $user_id, array $data): array {
+    if (!array_key_exists('profile_image', $data)) return [];
+
+    $stored = $this->store_profile_image($user_id, $data['profile_image']);
+    if (is_wp_error($stored)) {
+      return ['profile_image_synced' => false, 'profile_image_error' => $stored->get_error_message()];
     }
-    update_user_meta($user_id, self::META_PROFILE_IMAGE_URL, $image_url);
+    return ['profile_image_synced' => true];
+  }
+
+  private function store_profile_image(int $user_id, $image) {
+    $encoded = is_array($image) ? ($image['base64'] ?? null) : null;
+    if (!is_string($encoded) || $encoded === '' || strlen($encoded) > 4 * (int)ceil(self::MAX_PROFILE_IMAGE_BYTES / 3)) {
+      return new WP_Error('ecs_avatar_size', 'The incoming profile image is missing or too large.');
+    }
+    $bytes = base64_decode($encoded, true);
+    if ($bytes === false || strlen($bytes) > self::MAX_PROFILE_IMAGE_BYTES) {
+      return new WP_Error('ecs_avatar_encoding', 'The incoming profile image encoding is invalid.');
+    }
+    $dimensions = @getimagesizefromstring($bytes);
+    $extensions = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp', 'image/avif' => 'avif'];
+    $extension = $extensions[$dimensions['mime'] ?? ''] ?? '';
+    if ($extension === '' || $dimensions[0] < 1 || $dimensions[1] < 1 || max($dimensions[0], $dimensions[1]) > 2048) {
+      return new WP_Error('ecs_avatar_format', 'The incoming profile image format or dimensions are unsupported.');
+    }
+
+    $uploads = wp_get_upload_dir();
+    if (!empty($uploads['error']) || empty($uploads['basedir']) || empty($uploads['baseurl'])) {
+      return new WP_Error('ecs_avatar_directory', 'The connected site uploads directory is unavailable.');
+    }
+
+    $directory = trailingslashit($uploads['basedir']) . self::PROFILE_IMAGE_DIR;
+    $base_url = trailingslashit($uploads['baseurl']) . self::PROFILE_IMAGE_DIR . '/';
+    $meta_key = self::profile_image_meta_key();
+    $current = (string)get_user_meta($user_id, $meta_key, true);
+    $prefix = $user_id . '-' . hash('sha256', $bytes) . '-';
+    if (self::is_profile_image_filename($user_id, $current)
+      && strpos($current, $prefix) === 0 && is_readable($directory . '/' . $current)) {
+      update_user_meta($user_id, self::META_PROFILE_IMAGE_URL, esc_url_raw($base_url . $current));
+      return true;
+    }
+
+    if (!wp_mkdir_p($directory)) {
+      return new WP_Error('ecs_avatar_directory', 'The connected site could not create the profile image directory.');
+    }
+
+    $filename = $prefix . wp_generate_uuid4() . '.' . $extension;
+    $path = $directory . '/' . $filename;
+    if (@file_put_contents($path, $bytes) !== strlen($bytes)) {
+      wp_delete_file_from_directory($path, $directory);
+      return new WP_Error('ecs_avatar_write', 'The connected site could not write the profile image.');
+    }
+
+    $registered = $current !== ''
+      ? update_user_meta($user_id, $meta_key, $filename, $current)
+      : add_user_meta($user_id, $meta_key, $filename, true);
+    if (!$registered) {
+      wp_delete_file_from_directory($path, $directory);
+      return new WP_Error('ecs_avatar_save', 'The connected site could not save the profile image reference.');
+    }
+    if (self::is_profile_image_filename($user_id, $current)) {
+      wp_delete_file_from_directory($directory . '/' . $current, $directory);
+    }
+    update_user_meta($user_id, self::META_PROFILE_IMAGE_URL, esc_url_raw($base_url . $filename));
+    return true;
+  }
+
+  private static function profile_image_meta_key(): string {
+    return '_ecs_profile_image_file_' . get_current_blog_id();
+  }
+
+  private static function is_profile_image_filename(int $user_id, string $filename): bool {
+    return preg_match('/^' . $user_id . '-[a-f0-9]{64}-[a-f0-9-]{36}\.(jpg|png|gif|webp|avif)\z/', $filename) === 1;
+  }
+
+  public function delete_profile_image(int $user_id): void {
+    $meta_key = self::profile_image_meta_key();
+    $filename = (string)get_user_meta($user_id, $meta_key, true);
+    $uploads = wp_get_upload_dir();
+    if (self::is_profile_image_filename($user_id, $filename) && !empty($uploads['basedir'])) {
+      $directory = trailingslashit($uploads['basedir']) . self::PROFILE_IMAGE_DIR;
+      wp_delete_file_from_directory($directory . '/' . $filename, $directory);
+    }
+    if ($filename !== '') {
+      delete_user_meta($user_id, $meta_key, $filename);
+      if (!empty($uploads['baseurl'])) {
+        $url = esc_url_raw(trailingslashit($uploads['baseurl']) . self::PROFILE_IMAGE_DIR . '/' . $filename);
+        delete_user_meta($user_id, self::META_PROFILE_IMAGE_URL, $url);
+      }
+    }
   }
 
   public function filter_avatar_url(string $url, $id_or_email, array $args): string {
@@ -577,7 +657,14 @@ class ECS_Plugin {
     }
 
     if ($user_id <= 0) return '';
-    return esc_url((string)get_user_meta($user_id, self::META_PROFILE_IMAGE_URL, true));
+    $filename = (string)get_user_meta($user_id, self::profile_image_meta_key(), true);
+    if (!self::is_profile_image_filename($user_id, $filename)) return '';
+
+    $uploads = wp_get_upload_dir();
+    if (empty($uploads['basedir']) || empty($uploads['baseurl'])) return '';
+    $path = trailingslashit($uploads['basedir']) . self::PROFILE_IMAGE_DIR . '/' . $filename;
+    if (!is_readable($path)) return '';
+    return esc_url(trailingslashit($uploads['baseurl']) . self::PROFILE_IMAGE_DIR . '/' . $filename);
   }
 
   private function record_provision_audit(int $manager_id, string $manager_sub, string $reason, array $results): void {

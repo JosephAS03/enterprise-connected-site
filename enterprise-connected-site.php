@@ -2,13 +2,13 @@
 /**
  * Plugin Name: Enterprise Connected Site
  * Description: Provisions WordPress accounts from the internal portal and provides single sign-on through its OpenID Connect provider.
- * Version: 1.0.3
+ * Version: 1.0.4
  * Author: JAS Enterprises
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('ECS_VERSION', '1.0.3');
+define('ECS_VERSION', '1.0.4');
 define('ECS_PLUGIN_FILE', __FILE__);
 define('ECS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 
